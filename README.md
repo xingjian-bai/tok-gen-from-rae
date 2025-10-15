@@ -272,3 +272,14 @@ Use the ADM evaluation suite to score generated samples:
 ## TorchXLA / TPU support
 
 See `XLA` branch for TPU support.
+
+
+
+## Acknowledgement
+
+This code is built upon the following repositories:
+
+* [SiT](https://github.com/willisma/sit) - for diffusion implementation and training codebase.
+* [DDT](https://github.com/MCG-NJU/DDT) - for some of the DiT<sup>DH</sup> implementation.
+* [LightningDiT](https://github.com/hustvl/LightningDiT/) - for the PyTorch Lightning based DiT implementation.
+* [MAE](https://github.com/facebookresearch/mae) - for the ViT decoder architecture.
