@@ -1,6 +1,7 @@
 stage_1:
   target: stage1.RAE
-  ckpt: "results/stage1_mae/010-RAE-bf16/checkpoints/0000000.pt"
+  # ckpt: "results/stage1_mae/010-RAE-bf16/checkpoints/0000000.pt"
+  ckpt: "results/stage1_mae/stage1-mae/checkpoints/0039000.pt"
   params:
     # --- Encoder (MAE ViT-B/16, now fine-tuned) ---
     encoder_cls: 'MAEwNorm'

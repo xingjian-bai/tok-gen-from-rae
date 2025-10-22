@@ -126,24 +126,30 @@ def generate_samples(
     device: torch.device,
     num_steps: int = 1000,
     schedule_rho: float = 1.0,
+    bn_mean: Optional[torch.Tensor] = None,
+    bn_std: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     with torch.no_grad():
         latents = torch.randn(batch_size, latent_dim, latent_grid, latent_grid, device=device)
-        # Power schedule over t to concentrate more near low-noise region when rho>1
+        # Flow-matching Euler integration: dx/dt = g_theta(x,t)
         u = torch.linspace(0.0, 1.0, steps=num_steps + 1, device=device)
         if schedule_rho != 1.0:
             u = u.pow(schedule_rho)
-        t_vals = (1.0 - u).clamp(0.0, 0.999)
+        t_vals = u.clamp(0.0, 1.0)
+        x = latents
         for i in range(num_steps):
             t_curr = t_vals[i].expand(batch_size)
             t_next = t_vals[i + 1].expand(batch_size)
-            alpha_curr, sigma_curr = cosine_alpha_sigma(t_curr)
-            pred_velocity = model.forward_diffusion(latents, t_curr)
-            x0 = alpha_curr.view(-1, 1, 1, 1) * latents - sigma_curr.view(-1, 1, 1, 1) * pred_velocity
-            eps = sigma_curr.view(-1, 1, 1, 1) * latents + alpha_curr.view(-1, 1, 1, 1) * pred_velocity
-            alpha_next, sigma_next = cosine_alpha_sigma(t_next)
-            latents = alpha_next.view(-1, 1, 1, 1) * x0 + sigma_next.view(-1, 1, 1, 1) * eps
-        decoded = model.decode(latents)
+            dt = (t_next - t_curr).view(-1, 1, 1, 1)
+            pred_flow = model.forward_diffusion(x, t_curr)
+            x = x + dt * pred_flow
+        z_norm = x
+        if bn_mean is None:
+            bn_mean = torch.zeros(1, latent_dim, 1, 1, device=device)
+        if bn_std is None:
+            bn_std = torch.ones(1, latent_dim, 1, 1, device=device)
+        z = z_norm * bn_std + bn_mean
+        decoded = model.decode(z)
     return decoded
 
 
@@ -173,6 +179,8 @@ def main() -> None:
     # Sampling schedule controls
     parser.add_argument("--schedule-rho", type=float, default=1.0, help="Rho for power schedule of sampling timesteps (rho>1 densifies near t~0).")
     parser.add_argument("--sample-steps", type=int, default=1000, help="Number of steps for sample generation.")
+    # EMA of batch normalization statistics for latents (used for offline sampling)
+    parser.add_argument("--bn-ema-decay", type=float, default=0.99, help="EMA decay for per-channel latent mean/var tracking.")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint in output dir.")
@@ -275,14 +283,28 @@ def main() -> None:
 
     stage1_params = stage1_dict.get("params", {})
     stage1_noise_tau = float(stage1_params.get("noise_tau", 0.0))
-    loss_cfg = stage1_dict.get("gan", {}).get("loss", {})
+    # --- Read GAN config from FULL YAML (like Stage-1 does), fallback to Stage-2 if needed ---
+    full_stage1_yaml = OmegaConf.load(str(args.stage1_config))
+    stage1_gan_section = full_stage1_yaml.get("gan", None)
+    if stage1_gan_section is None or not stage1_gan_section:
+        try:
+            full_stage2_yaml = OmegaConf.load(str(args.stage2_config))
+            stage2_gan_section = full_stage2_yaml.get("gan", None)
+        except Exception:
+            stage2_gan_section = None
+        gan_cfg = OmegaConf.to_container(stage2_gan_section, resolve=True) if stage2_gan_section is not None else {}
+    else:
+        gan_cfg = OmegaConf.to_container(stage1_gan_section, resolve=True)
+    if not isinstance(gan_cfg, dict):
+        gan_cfg = {}
+    loss_cfg = gan_cfg.get("loss", {})
     lpips_start_epoch = int(loss_cfg.get("lpips_start", 0))
     perceptual_weight = float(args.lpips_weight if args.lpips_weight is not None else loss_cfg.get("perceptual_weight", 1.0))
     recon_weight = float(args.recon_weight if args.recon_weight is not None else 1.0)
     noise_std = stage1_noise_tau if args.noise_augment_std is None else args.noise_augment_std
-    gan_cfg = stage1_dict.get("gan", {})
+    diffusion_loss_gamma = float(args.diffusion_loss_gamma)
     disc_cfg = gan_cfg.get("disc", {})
-    disc_weight = float(loss_cfg.get("disc_weight", 0.0))
+    disc_weight = float(loss_cfg.get("disc_weight", 0.75))
     gan_start_epoch = int(loss_cfg.get("disc_start", 0))
     disc_update_epoch = int(loss_cfg.get("disc_upd_start", gan_start_epoch))
     disc_updates = int(loss_cfg.get("disc_updates", 1))
@@ -302,6 +324,8 @@ def main() -> None:
             time_shift_alpha = float(time_shift_alpha ** 0.5)
         else:
             time_shift_alpha = 1.0
+    if time_shift_alpha <= 1.0:
+        time_shift_alpha = 1.0
 
     config_for_wandb = {
         "lr_encoder": args.lr_encoder,
@@ -310,7 +334,7 @@ def main() -> None:
         "recon_weight": recon_weight,
         "lpips_weight": perceptual_weight,
         "diffusion_weight": args.diffusion_weight,
-        "diffusion_loss_gamma": args.diffusion_loss_gamma,
+        "diffusion_loss_gamma": diffusion_loss_gamma,
         "noise_augment_std": noise_std,
         "lpips_start_epoch": lpips_start_epoch,
         "image_log_interval": image_log_interval,
@@ -358,6 +382,13 @@ def main() -> None:
     disc_update_step = disc_update_epoch * total_batches
 
     if disc_weight > 0:
+        # Validate GAN discriminator config, provide helpful error if missing
+        arch_cfg = disc_cfg.get("arch", {}) if isinstance(disc_cfg, dict) else {}
+        if not arch_cfg or not arch_cfg.get("dino_ckpt_path"):
+            raise ValueError(
+                "GAN is enabled (disc_weight>0) but 'gan.disc.arch.dino_ckpt_path' is missing. "
+                "Please set this in your YAML (top-level 'gan' section) or disable GAN by setting disc_weight=0."
+            )
         discriminator, disc_aug = build_discriminator(disc_cfg, device)
         disc_params = [p for p in discriminator.parameters() if p.requires_grad]
         disc_optimizer, disc_optim_msg = build_optimizer(disc_params, disc_cfg)
@@ -404,6 +435,12 @@ def main() -> None:
             wandb.log({"plots/alpha_sigma": wandb.Image(str(plot_path))}, step=0)
 
     starting_step = step
+    # interval aggregators for reduced-variance logging
+    interval_sums: Dict[str, float] = {}
+    interval_counts: Dict[str, int] = {}
+    # persistent EMA stats for latent BN across training, saved in checkpoints
+    bn_ema_mean = torch.zeros(1, model.latent_dim, 1, 1, device=device)
+    bn_ema_var = torch.ones(1, model.latent_dim, 1, 1, device=device)
     for epoch in range(start_epoch, args.epochs):
         epoch_recon_sum = 0.0
         epoch_lpips_sum = 0.0
@@ -453,6 +490,16 @@ def main() -> None:
             total_loss_value = total_loss.detach().item()
             recon_opt.step()
 
+            # here, I want to add a batch-normalization to the latents. 
+            # This is to align the mean and variance of the latents with Gaussian noise, so diffusion can be more stable.
+            # this means, we first batch-normalize the latents, then apply noise and calculate the diffusion loss.
+            # in the later decoding stage, we of course need to un-batch-normalize the latents before decoding.
+            # In the generation stage, we need to deonise a normalized clean latent first; 
+            # and then use the batch statistics to de-normalize the latents, and then decode.
+
+            # so, basically I want the diffusion process to happen with targets being normalized. 
+            #  And since our encoder is changing along training, we have to use batch statistics to normalize the latents.
+
             # Diffusion step
             diff_opt.zero_grad(set_to_none=True)
             with torch.no_grad():
@@ -464,14 +511,17 @@ def main() -> None:
                 t = (a * t_raw) / (1.0 + (a - 1.0) * t_raw)
             else:
                 t = t_raw
-            alpha, sigma = cosine_alpha_sigma(t)
-            noise = torch.randn_like(latents_detached)
-            z_noisy = alpha.view(-1, 1, 1, 1) * latents_detached + sigma.view(-1, 1, 1, 1) * noise
-            pred_velocity = model.forward_diffusion(z_noisy, t)
-            target_velocity = velocity_target(latents_detached, noise, alpha, sigma)
+            # Normalize latents using EMA stats (training/inference unified)
+            bn_mean_use = bn_ema_mean
+            bn_std_use = bn_ema_var.sqrt().clamp(min=1e-6)
+            z_norm = (latents_detached - bn_mean_use) / bn_std_use
+            eps = torch.randn_like(z_norm)
+            x_t = (1.0 - t).view(-1, 1, 1, 1) * eps + t.view(-1, 1, 1, 1) * z_norm
+            target_flow = (z_norm - eps)
+            pred_flow = model.forward_diffusion(x_t, t)
             # per-sample squared error then weight: w(t) = (1 - t)^gamma
-            per_sample = (pred_velocity - target_velocity).pow(2).flatten(1).mean(dim=1)
-            weights = (1.0 - t).pow(float(args.diffusion_loss_gamma))
+            per_sample = (pred_flow - target_flow).pow(2).flatten(1).mean(dim=1)
+            weights = (1.0 - t).pow(diffusion_loss_gamma)
             diff_loss = (per_sample * weights).mean() * args.diffusion_weight
             diff_loss.backward()
             diff_opt.step()
@@ -500,6 +550,32 @@ def main() -> None:
                 if disc_scheduler is not None:
                     disc_scheduler.step()
 
+            # accumulate per-step metrics
+            def _acc(name: str, val: float) -> None:
+                interval_sums[name] = interval_sums.get(name, 0.0) + float(val)
+                interval_counts[name] = interval_counts.get(name, 0) + 1
+
+            _acc("loss/total", total_loss_value)
+            _acc("loss/recon", recon_l1.item())
+            _acc("loss/lpips", lpips_val.item())
+            _acc("loss/diffusion", diff_loss.item())
+            _acc("loss/gan", gan_loss_val.item())
+            _acc("gan/weight", (disc_weight * adaptive_weight.item()) if use_gan else 0.0)
+            enc_grad_val = math.sqrt(
+                sum(
+                    (p.grad.detach().pow(2).sum().item() if p.grad is not None else 0.0)
+                    for p in model.encoder.parameters()
+                )
+            )
+            _acc("grad/encoder", enc_grad_val)
+            _acc("latent/bn_mean", bn_mean_use.mean().item())
+            _acc("latent/bn_std", bn_std_use.mean().item())
+            _acc("latent/bn_var", (bn_std_use * bn_std_use).mean().item())
+            if disc_metrics is not None:
+                _acc("loss/disc", disc_metrics["loss/disc"].item())
+                _acc("disc/logits_real", disc_metrics["disc/logits_real"].item())
+                _acc("disc/logits_fake", disc_metrics["disc/logits_fake"].item())
+
             step += 1
             epoch_batches += 1
             epoch_recon_sum += recon_l1.item()
@@ -508,50 +584,68 @@ def main() -> None:
             epoch_diff_sum += diff_loss.item()
             if disc_weight > 0:
                 epoch_gan_sum += gan_loss_val.item()
-            if (step == starting_step + 1 or step % args.log_interval == 0 or (args.max_steps and step >= args.max_steps)) and is_main:
-                msg = (
-                    f"[Epoch {epoch} Step {step}] "
-                    f"loss/total={total_loss_value:.4f} "
-                    f"loss/recon={recon_l1.item():.4f} loss/lpips={lpips_val.item():.4f} "
-                    f"loss/diffusion={diff_loss.item():.4f} "
-                    f"loss/gan={gan_loss_val.item():.4f} "
-                    f"p_weight={perceptual_weight}"
-                )
-                print(msg)
-                if args.wandb and wandb is not None:
-                    enc_grad = math.sqrt(
-                        sum(
-                            (p.grad.detach().pow(2).sum().item() if p.grad is not None else 0.0)
-                            for p in model.encoder.parameters()
-                        )
+            # update EMA BN stats every step (multi-GPU aggregated)
+            with torch.no_grad():
+                # compute global mean and variance via mean of squares
+                m1 = latents_detached.mean(dim=(0, 2, 3), keepdim=True)
+                m2 = (latents_detached * latents_detached).mean(dim=(0, 2, 3), keepdim=True)
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(m1, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(m2, op=dist.ReduceOp.SUM)
+                    m1 /= world_size
+                    m2 /= world_size
+                v = (m2 - m1 * m1).clamp(min=0.0)
+                decay = float(args.bn_ema_decay)
+                bn_ema_mean.mul_(decay).add_(m1, alpha=1.0 - decay)
+                bn_ema_var.mul_(decay).add_(v, alpha=1.0 - decay)
+
+            should_log = (step == starting_step + 1) or (step % args.log_interval == 0) or (args.max_steps and step >= args.max_steps)
+            if should_log:
+                # compute distributed averages
+                averaged: Dict[str, float] = {}
+                for k, s in list(interval_sums.items()):
+                    sum_tensor = torch.tensor(s, device=device, dtype=torch.float32)
+                    cnt_tensor = torch.tensor(interval_counts.get(k, 0), device=device, dtype=torch.float32)
+                    if dist.is_available() and dist.is_initialized():
+                        dist.all_reduce(sum_tensor, op=dist.ReduceOp.SUM)
+                        dist.all_reduce(cnt_tensor, op=dist.ReduceOp.SUM)
+                    denom = max(cnt_tensor.item(), 1.0)
+                    averaged[k] = (sum_tensor.item() / denom)
+
+                if is_main:
+                    msg = (
+                        f"[Epoch {epoch} Step {step}] "
+                        f"loss/total={averaged.get('loss/total', 0.0):.4f} "
+                        f"loss/recon={averaged.get('loss/recon', 0.0):.4f} "
+                        f"loss/lpips={averaged.get('loss/lpips', 0.0):.4f} "
+                        f"loss/diffusion={averaged.get('loss/diffusion', 0.0):.4f} "
+                        f"loss/gan={averaged.get('loss/gan', 0.0):.4f} "
+                        f"p_weight={perceptual_weight}"
                     )
-                    wandb.log(
-                        {
-                            "loss/total": total_loss_value,
-                            "loss/recon": recon_l1.item(),
-                            "loss/lpips": lpips_val.item(),
-                            "loss/diffusion": diff_loss.item(),
-                            "loss/gan": gan_loss_val.item(),
-                            "gan/weight": disc_weight * adaptive_weight.item() if use_gan else 0.0,
-                            "grad/encoder": enc_grad,
+                    print(msg)
+                    if args.wandb and wandb is not None:
+                        payload = {
+                            **averaged,
                             "perceptual_weight": perceptual_weight,
                             "metrics/lpips_active": float(use_lpips),
                             "metrics/image_placeholder_norm": base_model.encoder.image_placeholder.norm().item(),
                             "metrics/latent_placeholder_norm": base_model.encoder.latent_placeholder.norm().item(),
+                            "latent/ema_mean": bn_ema_mean.mean().item(),
+                            "latent/ema_std": bn_ema_var.sqrt().mean().item(),
                             "step": step,
                             "epoch": epoch,
-                        },
-                        step=step,
-                    )
-                    if disc_metrics is not None:
-                        wandb_utils.log(
-                            {k: v.item() if torch.is_tensor(v) else v for k, v in disc_metrics.items()},
-                            step=step,
-                        )
+                        }
+                        wandb.log(payload, step=step)
+                # reset interval
+                interval_sums.clear()
+                interval_counts.clear()
 
             if (step == starting_step + 1 or step % image_log_interval == 0) and is_main:
                 diffusion_preds: Dict[float, Tuple[torch.Tensor, torch.Tensor]] = {}
                 with torch.no_grad():
+                    # switch to eval() to avoid dropout randomness during visualization
+                    was_training = model.training
+                    model.eval()
                     diffusion_levels = [
                         0.0,
                         0.05,
@@ -568,17 +662,23 @@ def main() -> None:
                     ]
                     for t_val in diffusion_levels:
                         t_level = torch.full((latents_base.size(0),), t_val, device=device)
-                        alpha_level, sigma_level = cosine_alpha_sigma(t_level)
-                        noise_level = torch.randn_like(latents_base)
-                        z_noisy_level = alpha_level.view(-1, 1, 1, 1) * latents_base + sigma_level.view(-1, 1, 1, 1) * noise_level
-                        pred_velocity_level = model.forward_diffusion(z_noisy_level, t_level)
-                        pred_latents_level = (
-                            alpha_level.view(-1, 1, 1, 1) * z_noisy_level
-                            - sigma_level.view(-1, 1, 1, 1) * pred_velocity_level
-                        )
-                        direct_decode = model.decode(z_noisy_level)
-                        pred_decode = model.decode(pred_latents_level)
+                        # FM visualization: build x_t from BN-normalized latents and epsilon
+                        mu_v = latents_base.mean(dim=(0, 2, 3), keepdim=True)
+                        var_v = latents_base.var(dim=(0, 2, 3), unbiased=False, keepdim=True)
+                        std_v = var_v.sqrt().clamp(min=1e-6)
+                        z_norm_v = (latents_base - mu_v) / std_v
+                        eps_v = torch.randn_like(z_norm_v)
+                        x_t_v = (1.0 - t_level).view(-1, 1, 1, 1) * eps_v + t_level.view(-1, 1, 1, 1) * z_norm_v
+                        pred_flow_v = model.forward_diffusion(x_t_v, t_level)
+                        z1_pred = x_t_v + (1.0 - t_level).view(-1, 1, 1, 1) * pred_flow_v
+                        # denormalize for decode
+                        z1_denorm = z1_pred * std_v + mu_v
+                        direct_decode = model.decode(x_t_v * std_v + mu_v)
+                        pred_decode = model.decode(z1_denorm)
                         diffusion_preds[t_val] = (direct_decode, pred_decode)
+                    # restore mode
+                    if was_training:
+                        model.train()
                 k_vis = min(8, batch_images.size(0))
                 recon_tensor = torch.cat([batch_images[:k_vis].detach().cpu(), recon_image[:k_vis].detach().cpu()], dim=0)
                 wandb_utils.log_image(
@@ -618,6 +718,9 @@ def main() -> None:
                     device=device,
                     num_steps=int(args.sample_steps),
                     schedule_rho=float(args.schedule_rho),
+                    # Prefer EMA stats to stabilize offline sampling semantics
+                    bn_mean=bn_ema_mean,
+                    bn_std=bn_ema_var.sqrt().clamp(min=1e-6),
                 )
                 wandb_utils.log_image(
                     samples[:k_vis].detach().cpu(),
@@ -634,6 +737,9 @@ def main() -> None:
                     "diff_opt": diff_opt.state_dict(),
                     "step": step,
                     "epoch": epoch,
+                    # persist EMA latent BN stats for future offline sampling
+                    "latent_bn_ema_mean": bn_ema_mean.detach().cpu(),
+                    "latent_bn_ema_var": bn_ema_var.detach().cpu(),
                 }
                 torch.save(ckpt, args.output_dir / f"phase3_step_{step:07d}.pt")
 

@@ -64,9 +64,9 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --stage1-config configs/stage1/training/MAE-B_dec_sample.yaml \
   --stage2-config configs/stage2/training/ImageNet256/DiTDH-S_MAE-B.yaml \
   --data-path /mnt/localssd/data/imagenet100/train/ \
-  --output-dir results/unified_phase3_first_run \
+  --output-dir results/unified_phase3_second_run \
   --epochs 100 \
-  --batch-size 16 \
+  --batch-size 32 \
   --workers 8 \
   --lr-encoder 1e-4 \
   --lr-decoder 1e-4 \
@@ -79,8 +79,8 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --image-log-interval 1000 \
   --save-interval 1000 \
   --wandb \
-  --run-name "phase3-gan-timeshift" \
-  --time-shift-alpha 2.0 \
-  --diffusion-loss-gamma 1.0 \
+  --run-name "phase3-gan-timeshift-fm-steered-ema_BN" \
+  --time-shift-alpha 6.93 \
+  --diffusion-loss-gamma 1.5 \
   --schedule-rho 1.5 \
   --sample-steps 250

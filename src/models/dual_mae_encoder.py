@@ -199,9 +199,10 @@ class DualMAEEncoder(nn.Module):
             return grid
 
         if images is not None and latents is None:
-            # For image-mode encoding, return image token features shaped as latent grid
+            # Reconstruction task (images provided): return latent token features for decoding
             return to_grid(image_states)
 
+        # Diffusion task (latents provided): return image token features to decouple task heads
         return to_grid(latent_states)
 
 
