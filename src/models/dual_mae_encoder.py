@@ -99,7 +99,11 @@ class DualMAEEncoder(nn.Module):
 
         self.latent_dim = latent_dim or self.embed_dim
         self.latent_proj = nn.Linear(self.latent_dim, self.embed_dim)
-        nn_init.eye_(self.latent_proj.weight)
+        # Initialize projection robustly even when dims differ
+        if self.latent_proj.weight.shape[0] == self.latent_proj.weight.shape[1]:
+            nn_init.eye_(self.latent_proj.weight)
+        else:
+            nn_init.xavier_uniform_(self.latent_proj.weight)
         nn_init.zeros_(self.latent_proj.bias)
 
         # Positional embeddings
@@ -121,7 +125,12 @@ class DualMAEEncoder(nn.Module):
         for key, value in state_dict.items():
             if key.startswith("encoder."):
                 mapped_key = key.replace("encoder.", "mae.")
-                mapped[mapped_key] = value
+            elif key.startswith("model."):
+                # Stage1 MAE encoder stores ViT under 'model.'
+                mapped_key = key.replace("model.", "mae.vit.")
+            else:
+                continue
+            mapped[mapped_key] = value
         self.load_state_dict(mapped, strict=False)
 
     def _patch_embed(self, images: torch.Tensor) -> torch.Tensor:
@@ -190,6 +199,7 @@ class DualMAEEncoder(nn.Module):
             return grid
 
         if images is not None and latents is None:
+            # For image-mode encoding, return image token features shaped as latent grid
             return to_grid(image_states)
 
         return to_grid(latent_states)

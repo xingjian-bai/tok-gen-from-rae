@@ -21,18 +21,25 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn, optim
 from torch.utils.data import DataLoader, DistributedSampler
-from torchvision import datasets, transforms, utils as tv_utils
-import math
+from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
 
 from omegaconf import OmegaConf
 
+from disc import (  # type: ignore
+    DiffAug,
+    build_discriminator,
+    hinge_d_loss,
+    vanilla_d_loss,
+    vanilla_g_loss,
+)
 from disc.lpips import LPIPS  # type: ignore
 from models.dual_mae_encoder import DualMAEEncoder
 from models.unified_ed import UnifiedEncoderDecoder, build_unified_model
 from utils.train_utils import parse_configs
 from utils.model_utils import instantiate_from_config
 from utils.diffusion_utils import cosine_alpha_sigma, velocity_target
+from utils.optim_utils import build_optimizer, build_scheduler
 
 try:
     import wandb
@@ -98,13 +105,55 @@ def build_dataloader(
     return loader, sampler
 
 
+def calculate_adaptive_weight(
+    recon_loss: torch.Tensor,
+    gan_loss: torch.Tensor,
+    layer: torch.nn.Parameter,
+    max_d_weight: float = 1e4,
+) -> torch.Tensor:
+    recon_grads = torch.autograd.grad(recon_loss, layer, retain_graph=True)[0]
+    gan_grads = torch.autograd.grad(gan_loss, layer, retain_graph=True)[0]
+    d_weight = torch.norm(recon_grads) / (torch.norm(gan_grads) + 1e-6)
+    d_weight = torch.clamp(d_weight, 0.0, max_d_weight)
+    return d_weight.detach()
+
+
+def generate_samples(
+    model: UnifiedEncoderDecoder,
+    batch_size: int,
+    latent_dim: int,
+    latent_grid: int,
+    device: torch.device,
+    num_steps: int = 1000,
+    schedule_rho: float = 1.0,
+) -> torch.Tensor:
+    with torch.no_grad():
+        latents = torch.randn(batch_size, latent_dim, latent_grid, latent_grid, device=device)
+        # Power schedule over t to concentrate more near low-noise region when rho>1
+        u = torch.linspace(0.0, 1.0, steps=num_steps + 1, device=device)
+        if schedule_rho != 1.0:
+            u = u.pow(schedule_rho)
+        t_vals = (1.0 - u).clamp(0.0, 0.999)
+        for i in range(num_steps):
+            t_curr = t_vals[i].expand(batch_size)
+            t_next = t_vals[i + 1].expand(batch_size)
+            alpha_curr, sigma_curr = cosine_alpha_sigma(t_curr)
+            pred_velocity = model.forward_diffusion(latents, t_curr)
+            x0 = alpha_curr.view(-1, 1, 1, 1) * latents - sigma_curr.view(-1, 1, 1, 1) * pred_velocity
+            eps = sigma_curr.view(-1, 1, 1, 1) * latents + alpha_curr.view(-1, 1, 1, 1) * pred_velocity
+            alpha_next, sigma_next = cosine_alpha_sigma(t_next)
+            latents = alpha_next.view(-1, 1, 1, 1) * x0 + sigma_next.view(-1, 1, 1, 1) * eps
+        decoded = model.decode(latents)
+    return decoded
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Unified encoder-decoder training with alternating objectives.")
     parser.add_argument("--stage1-config", type=Path, required=True, help="Path to Stage 1 config (must include ckpt).")
     parser.add_argument("--stage2-config", type=Path, required=True, help="Path to Stage 2 config (for diffusion params).")
     parser.add_argument("--data-path", type=Path, help="ImageFolder root (ImageNet).")
     parser.add_argument("--output-dir", type=Path, default=Path("results/unified_phase3"), help="Directory for checkpoints/logs.")
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--lr-encoder", type=float, default=1e-4)
@@ -118,6 +167,12 @@ def main() -> None:
     parser.add_argument("--image-log-interval", type=int, default=None, help="Steps between image logs (defaults to 20 * log_interval).")
     parser.add_argument("--save-interval", type=int, default=1000)
     parser.add_argument("--max-steps", type=int, default=None)
+    # Diffusion time shift and loss weighting
+    parser.add_argument("--time-shift-alpha", type=float, default=None, help="Time distortion alpha (>1 shifts mass to small-noise). Overrides misc if provided.")
+    parser.add_argument("--diffusion-loss-gamma", type=float, default=1.0, help="Gamma exponent for (1-t)^gamma weighting of diffusion loss.")
+    # Sampling schedule controls
+    parser.add_argument("--schedule-rho", type=float, default=1.0, help="Rho for power schedule of sampling timesteps (rho>1 densifies near t~0).")
+    parser.add_argument("--sample-steps", type=int, default=1000, help="Number of steps for sample generation.")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint in output dir.")
@@ -188,6 +243,7 @@ def main() -> None:
         ddp_model = base_model
 
     model = ddp_model.module if distributed else ddp_model
+    decoder_last_layer = model.decoder.decoder_pred.weight
 
     recon_opt = optim.AdamW(
         [
@@ -224,8 +280,28 @@ def main() -> None:
     perceptual_weight = float(args.lpips_weight if args.lpips_weight is not None else loss_cfg.get("perceptual_weight", 1.0))
     recon_weight = float(args.recon_weight if args.recon_weight is not None else 1.0)
     noise_std = stage1_noise_tau if args.noise_augment_std is None else args.noise_augment_std
+    gan_cfg = stage1_dict.get("gan", {})
+    disc_cfg = gan_cfg.get("disc", {})
+    disc_weight = float(loss_cfg.get("disc_weight", 0.0))
+    gan_start_epoch = int(loss_cfg.get("disc_start", 0))
+    disc_update_epoch = int(loss_cfg.get("disc_upd_start", gan_start_epoch))
+    disc_updates = int(loss_cfg.get("disc_updates", 1))
+    max_d_weight = float(loss_cfg.get("max_d_weight", 1e4))
+    disc_loss_type = loss_cfg.get("disc_loss", "hinge")
+    gen_loss_type = loss_cfg.get("gen_loss", "vanilla")
 
     image_log_interval = args.image_log_interval if args.image_log_interval is not None else args.log_interval * 20
+
+    # Compute time shift alpha from config if not provided
+    time_shift_alpha = args.time_shift_alpha
+    if time_shift_alpha is None:
+        shift_dim = misc_cfg.get("time_dist_shift_dim") if isinstance(misc_cfg, dict) else None
+        shift_base = misc_cfg.get("time_dist_shift_base") if isinstance(misc_cfg, dict) else None
+        if shift_dim is not None and shift_base is not None and float(shift_base) > 0:
+            time_shift_alpha = float(shift_dim) / float(shift_base)
+            time_shift_alpha = float(time_shift_alpha ** 0.5)
+        else:
+            time_shift_alpha = 1.0
 
     config_for_wandb = {
         "lr_encoder": args.lr_encoder,
@@ -234,12 +310,17 @@ def main() -> None:
         "recon_weight": recon_weight,
         "lpips_weight": perceptual_weight,
         "diffusion_weight": args.diffusion_weight,
+        "diffusion_loss_gamma": args.diffusion_loss_gamma,
         "noise_augment_std": noise_std,
         "lpips_start_epoch": lpips_start_epoch,
         "image_log_interval": image_log_interval,
+        "gan_weight": disc_weight,
         "latent_dim": model.latent_dim,
         "latent_grid": model.latent_grid,
         "data_path": str(args.data_path) if args.data_path else "fake",
+        "time_shift_alpha": time_shift_alpha,
+        "schedule_rho": args.schedule_rho,
+        "sample_steps": args.sample_steps,
     }
     if args.run_name is None:
         args.run_name = f"phase3-{Path(args.stage1_config).stem}"
@@ -273,6 +354,38 @@ def main() -> None:
         print(f"[Info] Batches per epoch: {total_batches}")
 
     lpips_start_step = lpips_start_epoch * total_batches
+    gan_start_step = gan_start_epoch * total_batches
+    disc_update_step = disc_update_epoch * total_batches
+
+    if disc_weight > 0:
+        discriminator, disc_aug = build_discriminator(disc_cfg, device)
+        disc_params = [p for p in discriminator.parameters() if p.requires_grad]
+        disc_optimizer, disc_optim_msg = build_optimizer(disc_params, disc_cfg)
+        disc_scheduler = None
+        if disc_cfg.get("scheduler"):
+            disc_scheduler, disc_sched_msg = build_scheduler(disc_optimizer, total_batches, disc_cfg)
+        else:
+            disc_sched_msg = None
+        disc_loss_fn, gen_loss_fn = (
+            hinge_d_loss if disc_loss_type == "hinge" else vanilla_d_loss,
+            vanilla_g_loss if gen_loss_type == "vanilla" else vanilla_g_loss,
+        )
+        if is_main:
+            print(f"[Info] GAN enabled with weight {disc_weight}")
+            print(f"[Info] Discriminator parameters: {sum(p.numel() for p in discriminator.parameters())/1e6:.2f}M")
+            if disc_optim_msg:
+                print(disc_optim_msg)
+            if disc_sched_msg:
+                print(disc_sched_msg)
+    else:
+        discriminator = None
+        disc_optimizer = None
+        disc_scheduler = None
+        disc_loss_fn = None
+        gen_loss_fn = None
+        disc_aug = None
+        if is_main:
+            print("[Info] GAN disabled (disc_weight <= 0).")
 
     if is_main:
         t_vals = torch.linspace(0.0, 0.999, steps=1000)
@@ -296,12 +409,14 @@ def main() -> None:
         epoch_lpips_sum = 0.0
         epoch_total_sum = 0.0
         epoch_diff_sum = 0.0
+        epoch_gan_sum = 0.0
         epoch_batches = 0
         if sampler is not None:
             sampler.set_epoch(epoch)
         for batch_images, batch_labels in loader:
             batch_images = batch_images.to(device)
             batch_labels = batch_labels.to(device)
+            real_normed = batch_images * 2.0 - 1.0
 
             # Reconstruction step
             recon_opt.zero_grad(set_to_none=True)
@@ -322,35 +437,84 @@ def main() -> None:
             use_lpips = step >= lpips_start_step and perceptual_weight > 0
             lpips_val = lpips_loss(recon_image, batch_images).mean() if use_lpips else torch.zeros((), device=device)
             total_recon = recon_l1 + perceptual_weight * lpips_val
-            total_recon.backward()
+            recon_normed = recon_image * 2.0 - 1.0
+            use_gan = disc_weight > 0 and step >= gan_start_step
+            gan_loss_val = torch.zeros_like(total_recon)
+            adaptive_weight = torch.zeros_like(total_recon)
+            if use_gan:
+                fake_aug = disc_aug.aug(recon_normed)
+                logits_fake, _ = discriminator(fake_aug, None)
+                gan_loss_val = gen_loss_fn(logits_fake)
+                adaptive_weight = calculate_adaptive_weight(total_recon, gan_loss_val, decoder_last_layer, max_d_weight)
+                total_loss = total_recon + disc_weight * adaptive_weight * gan_loss_val
+            else:
+                total_loss = total_recon
+            total_loss.backward()
+            total_loss_value = total_loss.detach().item()
             recon_opt.step()
 
             # Diffusion step
             diff_opt.zero_grad(set_to_none=True)
             with torch.no_grad():
                 latents_detached = latents_base.detach()
-            t = torch.rand(batch_images.size(0), device=device).clamp(0.001, 0.999)
+            t_raw = torch.rand(batch_images.size(0), device=device).clamp(0.001, 0.999)
+            # time-shift: t' = (alpha * t) / (1 + (alpha - 1) * t), alpha>=1 emphasizes small-noise
+            if time_shift_alpha is not None and time_shift_alpha > 1.0:
+                a = time_shift_alpha
+                t = (a * t_raw) / (1.0 + (a - 1.0) * t_raw)
+            else:
+                t = t_raw
             alpha, sigma = cosine_alpha_sigma(t)
             noise = torch.randn_like(latents_detached)
             z_noisy = alpha.view(-1, 1, 1, 1) * latents_detached + sigma.view(-1, 1, 1, 1) * noise
             pred_velocity = model.forward_diffusion(z_noisy, t)
             target_velocity = velocity_target(latents_detached, noise, alpha, sigma)
-            diff_loss = F.mse_loss(pred_velocity, target_velocity) * args.diffusion_weight
+            # per-sample squared error then weight: w(t) = (1 - t)^gamma
+            per_sample = (pred_velocity - target_velocity).pow(2).flatten(1).mean(dim=1)
+            weights = (1.0 - t).pow(float(args.diffusion_loss_gamma))
+            diff_loss = (per_sample * weights).mean() * args.diffusion_weight
             diff_loss.backward()
             diff_opt.step()
+
+            train_disc = disc_weight > 0 and step >= disc_update_step
+            disc_metrics = None
+            if train_disc:
+                discriminator.train()
+                for _ in range(disc_updates):
+                    disc_optimizer.zero_grad(set_to_none=True)
+                    with torch.no_grad():
+                        fake_detached = recon_normed.detach().clamp(-1.0, 1.0)
+                        fake_detached = torch.round((fake_detached + 1.0) * 127.5) / 127.5 - 1.0
+                        fake_input = disc_aug.aug(fake_detached)
+                        real_input = disc_aug.aug(real_normed)
+                    logits_fake, logits_real = discriminator(fake_input, real_input)
+                    d_loss = disc_loss_fn(logits_real, logits_fake)
+                    d_loss.backward()
+                    disc_optimizer.step()
+                    disc_metrics = {
+                        "loss/disc": d_loss.detach(),
+                        "disc/logits_real": logits_real.detach().mean(),
+                        "disc/logits_fake": logits_fake.detach().mean(),
+                    }
+                discriminator.eval()
+                if disc_scheduler is not None:
+                    disc_scheduler.step()
 
             step += 1
             epoch_batches += 1
             epoch_recon_sum += recon_l1.item()
             epoch_lpips_sum += lpips_val.item()
-            epoch_total_sum += total_recon.item()
+            epoch_total_sum += total_loss_value
             epoch_diff_sum += diff_loss.item()
+            if disc_weight > 0:
+                epoch_gan_sum += gan_loss_val.item()
             if (step == starting_step + 1 or step % args.log_interval == 0 or (args.max_steps and step >= args.max_steps)) and is_main:
                 msg = (
                     f"[Epoch {epoch} Step {step}] "
-                    f"loss/total={total_recon.item():.4f} "
+                    f"loss/total={total_loss_value:.4f} "
                     f"loss/recon={recon_l1.item():.4f} loss/lpips={lpips_val.item():.4f} "
                     f"loss/diffusion={diff_loss.item():.4f} "
+                    f"loss/gan={gan_loss_val.item():.4f} "
                     f"p_weight={perceptual_weight}"
                 )
                 print(msg)
@@ -363,10 +527,12 @@ def main() -> None:
                     )
                     wandb.log(
                         {
-                            "loss/total": total_recon.item(),
+                            "loss/total": total_loss_value,
                             "loss/recon": recon_l1.item(),
                             "loss/lpips": lpips_val.item(),
                             "loss/diffusion": diff_loss.item(),
+                            "loss/gan": gan_loss_val.item(),
+                            "gan/weight": disc_weight * adaptive_weight.item() if use_gan else 0.0,
                             "grad/encoder": enc_grad,
                             "perceptual_weight": perceptual_weight,
                             "metrics/lpips_active": float(use_lpips),
@@ -377,6 +543,11 @@ def main() -> None:
                         },
                         step=step,
                     )
+                    if disc_metrics is not None:
+                        wandb_utils.log(
+                            {k: v.item() if torch.is_tensor(v) else v for k, v in disc_metrics.items()},
+                            step=step,
+                        )
 
             if (step == starting_step + 1 or step % image_log_interval == 0) and is_main:
                 diffusion_preds: Dict[float, Tuple[torch.Tensor, torch.Tensor]] = {}
@@ -410,7 +581,13 @@ def main() -> None:
                         diffusion_preds[t_val] = (direct_decode, pred_decode)
                 k_vis = min(8, batch_images.size(0))
                 recon_tensor = torch.cat([batch_images[:k_vis].detach().cpu(), recon_image[:k_vis].detach().cpu()], dim=0)
-                wandb_utils.log_image(recon_tensor, step=step, nrow=k_vis, name_suffix="_recon")
+                wandb_utils.log_image(
+                    recon_tensor,
+                    step=step,
+                    nrow=k_vis,
+                    name_suffix="_recon",
+                    caption="Row1: GT, Row2: Reconstruction",
+                )
                 gt_cpu = batch_images[:k_vis].detach().cpu()
                 recon_cpu = recon_image[:k_vis].detach().cpu()
                 for t_val, (direct_img, pred_img) in diffusion_preds.items():
@@ -430,7 +607,25 @@ def main() -> None:
                         step=step,
                         nrow=k_vis,
                         name_suffix=f"_diffusion_{t_val:.2f}",
+                        caption="Rows: GT, Recon, Noisy decode, Denoised decode",
                     )
+
+                samples = generate_samples(
+                    model,
+                    batch_size=k_vis,
+                    latent_dim=model.latent_dim,
+                    latent_grid=model.latent_grid,
+                    device=device,
+                    num_steps=int(args.sample_steps),
+                    schedule_rho=float(args.schedule_rho),
+                )
+                wandb_utils.log_image(
+                    samples[:k_vis].detach().cpu(),
+                    step=step,
+                    nrow=k_vis,
+                    name_suffix="_samples",
+                    caption="Generated samples from Gaussian noise",
+                )
 
             if step % args.save_interval == 0 and is_main:
                 ckpt = {
@@ -453,10 +648,12 @@ def main() -> None:
             avg_lpips = epoch_lpips_sum / epoch_batches
             avg_total = epoch_total_sum / epoch_batches
             avg_diff = epoch_diff_sum / epoch_batches
+            avg_gan = epoch_gan_sum / epoch_batches if disc_weight > 0 else 0.0
             print(
                 f"[Epoch {epoch}] "
                 f"epoch/loss_total={avg_total:.4f} epoch/loss_recon={avg_recon:.4f} "
-                f"epoch/loss_lpips={avg_lpips:.4f} epoch/loss_diffusion={avg_diff:.4f}"
+                f"epoch/loss_lpips={avg_lpips:.4f} epoch/loss_diffusion={avg_diff:.4f} "
+                f"epoch/loss_gan={avg_gan:.4f}"
             )
             if args.wandb and wandb is not None:
                 wandb.log(
@@ -465,6 +662,7 @@ def main() -> None:
                         "epoch/loss_recon": avg_recon,
                         "epoch/loss_lpips": avg_lpips,
                         "epoch/loss_diffusion": avg_diff,
+                        "epoch/loss_gan": avg_gan,
                         "metrics/image_placeholder_norm": base_model.encoder.image_placeholder.norm().item(),
                         "metrics/latent_placeholder_norm": base_model.encoder.latent_placeholder.norm().item(),
                         "epoch": epoch,

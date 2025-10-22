@@ -1,4 +1,7 @@
-import wandb
+try:
+    import wandb  # type: ignore
+except Exception:  # pragma: no cover
+    wandb = None  # type: ignore
 import torch
 from torchvision.utils import make_grid
 import torch.distributed as dist
@@ -10,7 +13,15 @@ import math
 
 
 def is_main_process():
-    return dist.get_rank() == 0
+    """Return True if this is rank 0 or if distributed is not initialized."""
+    if not dist.is_available():
+        return True
+    if not dist.is_initialized():
+        return True
+    try:
+        return dist.get_rank() == 0
+    except Exception:
+        return True
 
 def namespace_to_dict(namespace):
     return {
@@ -38,14 +49,18 @@ def initialize(args, entity, exp_name, project_name):
 
 
 def log(stats, step=None):
+    if wandb is None:
+        return
     if is_main_process():
         wandb.log({k: v for k, v in stats.items()}, step=step)
 
 
-def log_image(sample, step=None, nrow=None, name_suffix=""):
+def log_image(sample, step=None, nrow=None, name_suffix="", caption=None):
+    if wandb is None:
+        return
     if is_main_process():
         sample = array2grid(sample, nrow=nrow)
-        wandb.log({f"samples{name_suffix}": wandb.Image(sample), "train_step": step})
+        wandb.log({f"samples{name_suffix}": wandb.Image(sample, caption=caption), "train_step": step})
 
 
 def array2grid(x, nrow=None):

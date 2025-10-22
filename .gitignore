@@ -13,3 +13,5 @@ __pycache__/
 /checkpoints/
 upload_to_hf.py
 /*.png
+
+core*

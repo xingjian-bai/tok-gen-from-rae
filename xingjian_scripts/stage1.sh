@@ -41,3 +41,46 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --resume
 
 python run_scripts/create_imagenet100.py --imagenet_dir /mnt/localssd/data/imagenet/ --imagenet100_dir /mnt/localssd/data/imagenet100/
+
+# continue 
+torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+  src/train_unified_v2.py \
+  --stage1-config configs/stage1/training/MAE-B_dec_sample.yaml \
+  --stage2-config configs/stage2/training/ImageNet256/DiTDH-S_MAE-B.yaml \
+  --data-path /mnt/localssd/data/imagenet100/train/ \
+  --output-dir results/unified_phase3_first_run \
+  --batch-size 8 \
+  --epochs 20 \
+  --log-interval 10 \
+  --image-log-interval 500 \
+  --save-interval 1000 \
+  --wandb \
+  --run-name phase3-mae-diffusion \
+  --resume
+
+
+torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+  src/train_unified_v2.py \
+  --stage1-config configs/stage1/training/MAE-B_dec_sample.yaml \
+  --stage2-config configs/stage2/training/ImageNet256/DiTDH-S_MAE-B.yaml \
+  --data-path /mnt/localssd/data/imagenet100/train/ \
+  --output-dir results/unified_phase3_first_run \
+  --epochs 100 \
+  --batch-size 16 \
+  --workers 8 \
+  --lr-encoder 1e-4 \
+  --lr-decoder 1e-4 \
+  --lr-diffusion 2e-4 \
+  --recon-weight 1.0 \
+  --lpips-weight 1.0 \
+  --diffusion-weight 1.0 \
+  --noise-augment-std 0.05 \
+  --log-interval 50 \
+  --image-log-interval 1000 \
+  --save-interval 1000 \
+  --wandb \
+  --run-name "phase3-gan-timeshift" \
+  --time-shift-alpha 2.0 \
+  --diffusion-loss-gamma 1.0 \
+  --schedule-rho 1.5 \
+  --sample-steps 250
