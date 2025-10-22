@@ -1,0 +1,71 @@
+stage_1:
+  target: stage1.RAE
+  ckpt: "results/stage1_mae/010-RAE-bf16/checkpoints/0000000.pt"
+  params:
+    # --- Encoder (MAE ViT-B/16, now fine-tuned) ---
+    encoder_cls: 'MAEwNorm'
+    encoder_config_path: 'facebook/vit-mae-base'
+    encoder_input_size: 256
+    encoder_params:
+      model_name: 'facebook/vit-mae-base'
+    # --- Decoder (ViT-XL variant w/ matching latent dim) ---
+    decoder_config_path: 'configs/decoder/ViTXL'
+    decoder_patch_size: 16
+    pretrained_decoder_path: null  # set to checkpoint path if warm-starting the decoder
+    # --- Latent processing options ---
+    noise_tau: 0.0
+    reshape_to_2d: true
+    normalization_stat_path: null
+
+training:
+  epochs: 20
+  ema_decay: 0.9978
+  batch_size: 64  # per GPU batch size (total 512 when using 8 GPUs)
+  num_workers: 8
+  clip_grad: 0.0
+  log_interval: 100
+  checkpoint_interval: 5000
+  sample_interval: 0
+  encoder_lr_scale: 0.1  # relative learning rate applied to encoder parameters
+  optimizer:
+    lr: 2.0e-4
+    betas: [0.5, 0.9]
+    weight_decay: 0.0
+  scheduler:
+    type: cosine
+    warmup_epochs: 1
+    decay_end_epoch: 20
+    base_lr: 2.0e-4
+    final_lr: 2.0e-5
+
+gan:
+  disc:
+    arch:
+      dino_ckpt_path: 'models/discs/dino_vit_small_patch8_224.pth'
+      ks: 9
+      norm_type: 'bn'
+      using_spec_norm: true
+      recipe: 'S_8'
+    optimizer:
+      lr: 2.0e-4
+      betas: [0.5, 0.9]
+      weight_decay: 0.0
+    scheduler:
+      type: cosine
+      warmup_epochs: 1
+      decay_end_epoch: 20
+      base_lr: 2.0e-4
+      final_lr: 2.0e-5
+    augment:
+      prob: 1.0
+      cutout: 0.0
+  loss:
+    disc_loss: hinge
+    gen_loss: vanilla
+    disc_weight: 0.75
+    perceptual_weight: 1.0
+    disc_start: 8
+    disc_upd_start: 6
+    lpips_start: 0
+    max_d_weight: 10000.0
+    disc_updates: 1

@@ -20,6 +20,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import LambdaLR
@@ -47,6 +48,18 @@ from utils.train_utils import parse_configs
 from utils.optim_utils import build_optimizer, build_scheduler
 
 
+def _init_weights(module: nn.Module) -> None:
+    if isinstance(module, (nn.Linear, nn.Conv1d, nn.Conv2d)):
+        nn.init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
+        if module.weight is not None:
+            nn.init.ones_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train Stage-1 RAE with GAN and LPIPS losses.")
     parser.add_argument("--config", type=str, required=True, help="YAML config containing a stage_1 section.")
@@ -56,6 +69,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="fp32")
     parser.add_argument("--global-seed", type=int, default=None, help="Override training.global_seed from the config.")    
     parser.add_argument("--ckpt", type=str, default=None, help="Optional checkpoint path to resume training.")
+    parser.add_argument("--freeze-encoder", action="store_true", help="If set, keeps the MAE encoder frozen (legacy behaviour).")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override per-GPU batch size from config.")
+    parser.add_argument("--num-workers", type=int, default=None, help="Override dataloader workers.")
+    parser.add_argument("--log-interval", type=int, default=None, help="Print/log losses every N steps.")
+    parser.add_argument("--image-log-interval", type=int, default=None, help="Log recon images to WandB every N steps.")
+    parser.add_argument("--save-interval", type=int, default=None, help="Checkpoint every N steps.")
+    parser.add_argument("--run-name", type=str, default=None, help="Optional experiment directory name (overrides auto index).")
+    parser.add_argument("--scratch-encoder", action="store_true", help="Re-initialise the encoder weights instead of loading MAE pretrained weights.")
+    parser.add_argument("--scratch-decoder", action="store_true", help="Re-initialise the decoder weights instead of loading pretrained checkpoint.")
     parser.add_argument('--wandb', action='store_true', help='Use Weights & Biases for logging if set.')
     return parser.parse_args()
 
@@ -222,6 +244,17 @@ def main():
     training_cfg = OmegaConf.to_container(training_section, resolve=True) if training_section is not None else {}
     training_cfg = dict(training_cfg) if isinstance(training_cfg, dict) else {}
 
+    if args.batch_size is not None:
+        training_cfg["batch_size"] = args.batch_size
+    if args.num_workers is not None:
+        training_cfg["num_workers"] = args.num_workers
+    if args.log_interval is not None:
+        training_cfg["log_interval"] = args.log_interval
+    if args.image_log_interval is not None:
+        training_cfg["image_log_interval"] = args.image_log_interval
+    if args.save_interval is not None:
+        training_cfg["checkpoint_interval"] = args.save_interval
+
     gan_section = full_cfg.get("gan", None)
     gan_cfg = OmegaConf.to_container(gan_section, resolve=True) if gan_section is not None else {}
     if not gan_cfg:
@@ -248,6 +281,7 @@ def main():
     if clip_grad is not None and clip_grad <= 0:
         clip_grad = None
     log_interval = int(training_cfg.get("log_interval", 100))
+    image_log_interval = int(training_cfg.get("image_log_interval", 0))
     checkpoint_interval = int(training_cfg.get("checkpoint_interval", 1000))
     ema_decay = float(training_cfg.get("ema_decay", 0.9999))
     num_epochs = int(training_cfg.get("epochs", 200))
@@ -258,21 +292,38 @@ def main():
     torch.cuda.manual_seed_all(seed)
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)
-        experiment_index = len(glob(f"{args.results_dir}/*")) - 1
         model_target = str(rae_config.get("target", "stage1"))
         model_string_name = model_target.split(".")[-1]
         precision_suffix = f"-{args.precision}" if args.precision == "bf16" else ""
-        experiment_name = (
-            f"{experiment_index:03d}-{model_string_name}{precision_suffix}"
-        )
+        if args.run_name:
+            experiment_name = args.run_name
+        else:
+            experiment_index = len(glob(f"{args.results_dir}/*")) - 1
+            experiment_name = (
+                f"{experiment_index:03d}-{model_string_name}{precision_suffix}"
+            )
         experiment_dir = os.path.join(args.results_dir, experiment_name)
         checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
         if args.wandb:
-            entity = os.environ["ENTITY"]
-            project = os.environ["PROJECT"]
+            # Accept both legacy (ENTITY/PROJECT) and WANDB_* env var names.
+            entity = os.environ.get("WANDB_ENTITY") or os.environ.get("ENTITY")
+            project = os.environ.get("WANDB_PROJECT") or os.environ.get("PROJECT")
+            wandb_key = os.environ.get("WANDB_KEY")
+            missing_vars = [name for name, value in [
+                ("WANDB_KEY", wandb_key),
+                ("WANDB_ENTITY or ENTITY", entity),
+                ("WANDB_PROJECT or PROJECT", project),
+            ] if value is None]
+            if missing_vars:
+                missing_str = ", ".join(missing_vars)
+                raise EnvironmentError(
+                    f"Weights & Biases logging requested but environment variables are missing: {missing_str}. "
+                    "Export the required variables before launching training, e.g.\n"
+                    "  export WANDB_KEY=...; export WANDB_ENTITY=...; export WANDB_PROJECT=..."
+                )
             wandb_utils.initialize(args, entity, experiment_name, project)
     else:
         experiment_dir = None
@@ -280,8 +331,24 @@ def main():
         logger = create_logger(None)
     
     rae: RAE = instantiate_from_config(rae_config).to(device)
-    rae.encoder.eval()
+    if args.scratch_encoder:
+        if rank == 0:
+            logger.info("Reinitialising encoder weights from scratch.")
+        encoder_module = getattr(rae.encoder, "model", rae.encoder)
+        if hasattr(encoder_module, "_init_weights"):
+            encoder_module.apply(encoder_module._init_weights)
+        else:
+            rae.encoder.apply(_init_weights)
+    if args.scratch_decoder:
+        if rank == 0:
+            logger.info("Reinitialising decoder weights from scratch.")
+        rae.decoder.apply(_init_weights)
+
     rae.decoder.train()
+    if args.freeze_encoder:
+        rae.encoder.eval()
+    else:
+        rae.encoder.train()
     ema_model = deepcopy(rae).to(device).eval()
     ema_model.requires_grad_(False)
     # only train decoder
@@ -289,7 +356,48 @@ def main():
     rae.decoder.requires_grad_(True)
     ddp_model = DDP(rae, device_ids=[device.index], broadcast_buffers=False, find_unused_parameters=False)  # type: ignore[arg-type]
     decoder = ddp_model.module.decoder
-    optimizer, optim_msg = build_optimizer(decoder.parameters(), training_cfg)
+    encoder_trainable = not args.freeze_encoder
+    if encoder_trainable:
+        rae.encoder.requires_grad_(True)
+        rae.encoder.train()
+    else:
+        rae.encoder.requires_grad_(False)
+        rae.encoder.eval()
+    if rank == 0:
+        print(f"[Info] Stage1 encoder trainable: {encoder_trainable}")
+        logger.info(f"Stage1 encoder trainable: {encoder_trainable}")
+    opt_cfg = dict(training_cfg.get("optimizer", {}))
+    base_lr = float(opt_cfg.get("lr", training_cfg.get("base_lr", 2e-4)))
+    encoder_lr_scale = float(training_cfg.get("encoder_lr_scale", 0.1))
+    encoder_lr = float(opt_cfg.get("encoder_lr", base_lr * encoder_lr_scale))
+    betas_cfg = opt_cfg.get("betas", opt_cfg.get("beta", (0.9, 0.95)))
+    if isinstance(betas_cfg, (list, tuple)):
+        if len(betas_cfg) != 2:
+            raise ValueError("Expected betas to have two values.")
+        betas = (float(betas_cfg[0]), float(betas_cfg[1]))
+    else:
+        betas = (float(betas_cfg), float(betas_cfg))
+    weight_decay = float(opt_cfg.get("weight_decay", opt_cfg.get("wd", 0.0)))
+    eps = float(opt_cfg.get("eps", 1e-8))
+
+    param_groups: list[dict] = [
+        {"params": decoder.parameters(), "lr": base_lr},
+    ]
+    if encoder_trainable:
+        if "model_woddp" not in locals():
+            model_woddp = ddp_model.module
+        param_groups.append({"params": model_woddp.encoder.parameters(), "lr": encoder_lr})
+
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        betas=betas,
+        weight_decay=weight_decay,
+        eps=eps,
+    )
+    optim_msg = (
+        f"Optimizer: AdamW with decoder_lr={base_lr:.2e}, encoder_lr={encoder_lr if encoder_trainable else 0.0:.2e}, "
+        f"betas={betas}, weight_decay={weight_decay}, eps={eps}"
+    )
     model_woddp = ddp_model.module
     discriminator, disc_aug = build_discriminator(disc_cfg, device)
     disc_params = [p for p in discriminator.parameters() if p.requires_grad]
@@ -433,6 +541,23 @@ def main():
                 scheduler.step()
 
             update_ema(ema_model, ddp_model.module, ema_decay)
+
+            if (
+                args.wandb
+                and image_log_interval > 0
+                and rank == 0
+                and global_step % image_log_interval == 0
+            ):
+                with torch.no_grad():
+                    k = min(4, images.size(0))
+                    sample = torch.cat(
+                        [
+                            images[:k].detach().cpu(),
+                            recon[:k].detach().cpu().clamp(0.0, 1.0),
+                        ],
+                        dim=0,
+                    )
+                wandb_utils.log_image(sample, step=global_step, nrow=k)
 
             disc_metrics: Dict[str, torch.Tensor] = {}
             if train_disc:

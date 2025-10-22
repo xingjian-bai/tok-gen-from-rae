@@ -10,6 +10,9 @@ class MAEwNorm(nn.Module):
         super().__init__()
         self.model_name = model_name
         self.model = ViTMAEForPreTraining.from_pretrained(self.model_name).vit
+        # Freeze encoder to keep gradients from flowing during Stage 1 training.
+        self.model.eval()
+        self.model.requires_grad_(False)
         # remove the affine of final layernorm
         self.model.layernorm.elementwise_affine = False
         # remove the param

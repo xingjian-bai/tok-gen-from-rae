@@ -228,8 +228,21 @@ def main(args):
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
         if args.wandb:
-            entity = os.environ["ENTITY"]
-            project = os.environ["PROJECT"]
+            entity = os.environ.get("WANDB_ENTITY") or os.environ.get("ENTITY")
+            project = os.environ.get("WANDB_PROJECT") or os.environ.get("PROJECT")
+            wandb_key = os.environ.get("WANDB_KEY")
+            missing_vars = [name for name, value in [
+                ("WANDB_KEY", wandb_key),
+                ("WANDB_ENTITY or ENTITY", entity),
+                ("WANDB_PROJECT or PROJECT", project),
+            ] if value is None]
+            if missing_vars:
+                missing_str = ", ".join(missing_vars)
+                raise EnvironmentError(
+                    f"Weights & Biases logging requested but environment variables are missing: {missing_str}. "
+                    "Export the required variables before launching training, e.g.\n"
+                    "  export WANDB_KEY=...; export WANDB_ENTITY=...; export WANDB_PROJECT=..."
+                )
             wandb_utils.initialize(args, entity, experiment_name, project)
     else:
         experiment_dir = None

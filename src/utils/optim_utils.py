@@ -78,9 +78,6 @@ def build_scheduler(
     decay_end_steps = max(decay_end_steps, warmup_steps)
     total_decay_steps = max(decay_end_steps - warmup_steps, 1)
 
-    for group in optimizer.param_groups:
-        group["lr"] = base_lr
-
     if schedule_type == "linear":
 
         def lr_lambda(step: int) -> float:
