@@ -199,10 +199,10 @@ class DualMAEEncoder(nn.Module):
             return grid
 
         if images is not None and latents is None:
-            # Reconstruction task (images provided): return latent token features for decoding
+            # Reconstruction task (images provided): return image token features for decoding
             return to_grid(image_states)
 
-        # Diffusion task (latents provided): return image token features to decouple task heads
+        # Diffusion task (latents provided): return latent token features for denoising
         return to_grid(latent_states)
 
 

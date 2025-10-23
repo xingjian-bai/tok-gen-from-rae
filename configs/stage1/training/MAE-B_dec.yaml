@@ -7,8 +7,8 @@ stage_1:
     encoder_input_size: 256
     encoder_params:
       model_name: 'facebook/vit-mae-base'
-    # --- Decoder (ViT-XL variant w/ matching latent dim) ---
-    decoder_config_path: 'configs/decoder/ViTXL'
+    # --- Decoder (ViT-B variant w/ matching latent dim) ---
+    decoder_config_path: 'configs/decoder/ViTB'
     decoder_patch_size: 16
     pretrained_decoder_path: null  # set to checkpoint path if warm-starting the decoder
     # --- Latent processing options ---

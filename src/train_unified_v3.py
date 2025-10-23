@@ -24,7 +24,6 @@ import torch.nn.functional as F
 from torch import nn, optim
 from torch.utils.data import DataLoader, DistributedSampler
 from torchvision import datasets, transforms
-import matplotlib.pyplot as plt
 
 from omegaconf import OmegaConf
 
@@ -40,8 +39,8 @@ from models.dual_mae_encoder import DualMAEEncoder
 from models.unified_ed import UnifiedEncoderDecoder, build_unified_model
 from utils.train_utils import parse_configs
 from utils.model_utils import instantiate_from_config
-from utils.diffusion_utils import cosine_alpha_sigma, velocity_target
 from utils.optim_utils import build_optimizer, build_scheduler
+from stage2.transport import create_transport, Sampler
 
 try:
     import wandb
@@ -121,58 +120,42 @@ def calculate_adaptive_weight(
 
 
 def generate_samples(
+    transport_sampler: Sampler,
+    sampler_mode: str,
+    sampler_defaults: Dict[str, Any],
+    velocity_model,
     model: UnifiedEncoderDecoder,
     batch_size: int,
     latent_dim: int,
     latent_grid: int,
     device: torch.device,
-    num_steps: int = 1000,
-    schedule_rho: float = 1.0,
-    time_shift_alpha: float = 1.0,
+    num_steps: int,
     bn_mean: Optional[torch.Tensor] = None,
     bn_std: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Flow-matching sampling: integrate the rectified-flow ODE
-        d x_t / dt = v_theta(x_t, t)
-    and keep the predicted clean latent z_hat at each step. After the solve we return both
-    the final clean decode and a stack of intermediate decodes (heavy-noise → light-noise).
+    Run Stage-2 style sampling for a given number of integration steps and decode
+    both the final latent and a stack of intermediate latents for visualisation.
     """
-    # Use inference_mode to avoid autograd overhead and reduce memory
     with torch.inference_mode():
-        x_t = torch.randn(batch_size, latent_dim, latent_grid, latent_grid, device=device)
-        u = torch.linspace(0.0, 1.0, steps=num_steps + 1, device=device)
-        if schedule_rho != 1.0:
-            u = u.pow(schedule_rho)
-        if time_shift_alpha is not None and time_shift_alpha > 1.0:
-            a = time_shift_alpha
-            u = (a * u) / (1.0 + (a - 1.0) * u)
-        t_vals = u.clamp(0.0, 1.0)
+        init = torch.randn(batch_size, latent_dim, latent_grid, latent_grid, device=device)
+        if sampler_mode == "SDE":
+            params = dict(sampler_defaults)
+            params["num_steps"] = num_steps
+            sample_fn = transport_sampler.sample_sde(**params)
+        else:  # default to ODE sampling
+            params = dict(sampler_defaults)
+            params["num_steps"] = num_steps
+            sample_fn = transport_sampler.sample_ode(**params)
 
-        z_hat_last = None
-        # Preselect at most 10 progress frames to decode, avoiding storing all latents
-        steps_to_sample = min(10, max(1, num_steps))
-        idx_lin = torch.linspace(0, max(0, num_steps - 1), steps=steps_to_sample, device=device)
-        selected_idx: set = set(int(i.item()) for i in idx_lin)
-        progress_latents: List[torch.Tensor] = []
+        trajectory = sample_fn(init, velocity_model)
+        if isinstance(trajectory, torch.Tensor):
+            # torchdiffeq returns tensor shaped (steps, B, C, H, W)
+            traj_list = [trajectory[i] for i in range(trajectory.shape[0])]
+        else:
+            traj_list = list(trajectory)
 
-        for i in range(num_steps):
-            t_curr = t_vals[i].expand(batch_size)
-            t_next = t_vals[i + 1].expand(batch_size)
-            pred_flow = model.forward_diffusion(x_t, t_curr)
-            one_minus_t = (1.0 - t_curr).view(-1, 1, 1, 1)
-            z_hat = x_t + one_minus_t * pred_flow
-            eps_hat = z_hat - pred_flow
-            z_hat_last = z_hat
-            # Keep only a few latents to decode later (after de-normalisation)
-            if i in selected_idx:
-                progress_latents.append(z_hat.detach().clone())
-            one_minus_t_next = (1.0 - t_next).view(-1, 1, 1, 1)
-            t_next_view = t_next.view(-1, 1, 1, 1)
-            x_t = one_minus_t_next * eps_hat + t_next_view * z_hat
-
-        if z_hat_last is None:
-            z_hat_last = x_t
+        final_latent = traj_list[-1]
 
         if bn_mean is None:
             bn_mean = torch.zeros(1, latent_dim, 1, 1, device=device)
@@ -183,17 +166,20 @@ def generate_samples(
         def _denorm(latent: torch.Tensor) -> torch.Tensor:
             return latent * bn_std + bn_mean
 
-        decoded_final = model.decode(_denorm(z_hat_last))
+        decoded_final = model.decode(_denorm(final_latent))
 
-        # Decode selected progress latents after de-normalisation
-        progress_decoded: List[torch.Tensor] = []
-        for z_sel in progress_latents:
-            progress_decoded.append(model.decode(_denorm(z_sel)))
-
-        if progress_decoded:
-            progress_stack = torch.stack(progress_decoded, dim=0)
+        total_steps = len(traj_list)
+        if total_steps <= 1:
+            progress_latents = [final_latent]
         else:
-            progress_stack = decoded_final.unsqueeze(0)
+            idx = torch.linspace(0, total_steps - 1, steps=min(10, total_steps), device=device)
+            progress_latents = [traj_list[int(i.item())] for i in idx]
+
+        progress_decoded = [model.decode(_denorm(lat)) for lat in progress_latents]
+        if len(progress_decoded) == 1:
+            progress_stack = progress_decoded[0].unsqueeze(0)
+        else:
+            progress_stack = torch.stack(progress_decoded, dim=0)
 
     return decoded_final, progress_stack
 
@@ -219,17 +205,12 @@ def main() -> None:
     parser.add_argument("--image-log-interval", type=int, default=None, help="Steps between image logs (defaults to 20 * log_interval).")
     parser.add_argument("--save-interval", type=int, default=1000)
     parser.add_argument("--max-steps", type=int, default=None)
-    # Diffusion time shift and loss weighting
-    parser.add_argument("--time-shift-alpha", type=float, default=None, help="Time distortion alpha (>1 shifts mass to small-noise). Overrides misc if provided.")
-    parser.add_argument("--diffusion-loss-gamma", type=float, default=1.0, help="Gamma exponent for (1-t)^gamma weighting of diffusion loss.")
-    # Sampling schedule controls
-    parser.add_argument("--schedule-rho", type=float, default=1.0, help="Rho for power schedule of sampling timesteps (rho>1 densifies near t~0).")
     parser.add_argument(
         "--sample-steps",
         type=int,
         nargs="*",
-        default=[1, 5, 10, 50, 250],
-        help="Number of flow-matching steps to use for unconditional sampling visualisations (one grid per value).",
+        default=None,
+        help="Number of integration steps for unconditional sampling visualisations (Stage-II defaults are used when omitted).",
     )
     # EMA of batch normalization statistics for latents (used for offline sampling)
     parser.add_argument("--bn-ema-decay", type=float, default=0.99, help="EMA decay for per-channel latent mean/var tracking.")
@@ -240,33 +221,6 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--freeze-decoder", action="store_true", help="Freeze decoder parameters and keep it in eval mode during training.")
     args = parser.parse_args()
-
-    # Normalise sample step list so downstream code always works with a clean, positive int sequence.
-    raw_sample_steps = args.sample_steps
-    if raw_sample_steps is None:
-        raw_sample_steps = []
-    if isinstance(raw_sample_steps, (int, float)):
-        raw_sample_steps = [raw_sample_steps]
-    else:
-        raw_sample_steps = list(raw_sample_steps)
-    normalised_steps = []
-    for value in raw_sample_steps:
-        try:
-            step_int = int(value)
-        except (TypeError, ValueError):
-            continue
-        if step_int > 0:
-            normalised_steps.append(step_int)
-    if not normalised_steps:
-        normalised_steps = [250]
-    # Preserve user ordering while removing duplicates
-    seen_steps = set()
-    ordered_steps: List[int] = []
-    for step_int in normalised_steps:
-        if step_int not in seen_steps:
-            seen_steps.add(step_int)
-            ordered_steps.append(step_int)
-    args.sample_steps = ordered_steps
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     if distributed:
@@ -375,13 +329,77 @@ def main() -> None:
         rank,
     )
     stage2_cfg, *_ = parse_configs(str(args.stage2_config))
-    if stage2_cfg is not None and "misc" in stage2_cfg:
-        misc_cfg = OmegaConf.to_container(stage2_cfg["misc"], resolve=True)
+    if stage2_cfg is not None:
+        stage2_dict = OmegaConf.to_container(stage2_cfg, resolve=True)
     else:
-        misc_cfg = {}
+        stage2_dict = {}
+    misc_cfg = stage2_dict.get("misc", {}) or {}
+    transport_cfg = stage2_dict.get("transport", {}) or {}
+    sampler_cfg = stage2_dict.get("sampler", {}) or {}
+    guidance_cfg = stage2_dict.get("guidance", {}) or {}
+    transport_params = dict(transport_cfg.get("params", {}))
+    transport_params.pop("time_dist_shift", None)  # handled explicitly below
+    default_shift_dim = int(misc_cfg.get("time_dist_shift_dim", model.latent_dim * model.latent_grid * model.latent_grid))
+    default_shift_base = int(misc_cfg.get("time_dist_shift_base", 4096))
+    time_dist_shift = math.sqrt(default_shift_dim / default_shift_base) if default_shift_base > 0 else 1.0
+    transport = create_transport(**transport_params, time_dist_shift=time_dist_shift)
+    transport_sampler = Sampler(transport)
+    def velocity_model(x_t: torch.Tensor, t: torch.Tensor, **_kwargs: Any) -> torch.Tensor:
+        # Prefer channel-first end-to-end. If transport provides (B,L,C), reshape to CF; else pass through.
+        if x_t.dim() == 3:
+            b, l, c = x_t.shape
+            g = model.latent_grid
+            assert l == g * g, "Token length must equal grid*grid"
+            x_cf = x_t.transpose(1, 2).reshape(b, c, g, g)
+            v_cf = model.forward_diffusion(x_cf, t)
+            return v_cf.flatten(2).transpose(1, 2)
+        else:
+            return model.forward_diffusion(x_t, t)
+    sampler_mode = str(sampler_cfg.get("mode", "ODE")).upper()
+    sampler_params = dict(sampler_cfg.get("params", {}))
+    if sampler_mode == "SDE":
+        sampler_defaults: Dict[str, Any] = {
+            "sampling_method": sampler_params.get("sampling_method", "euler"),
+            "diffusion_form": sampler_params.get("diffusion_form", "SBDM"),
+            "diffusion_norm": float(sampler_params.get("diffusion_norm", 1.0)),
+            "last_step": sampler_params.get("last_step", "Mean"),
+            "last_step_size": float(sampler_params.get("last_step_size", 0.04)),
+        }
+        sampler_base_steps = int(sampler_params.get("num_steps", 250))
+    else:
+        sampler_defaults = {
+            "sampling_method": sampler_params.get("sampling_method", "dopri5"),
+            "atol": float(sampler_params.get("atol", 1e-6)),
+            "rtol": float(sampler_params.get("rtol", 1e-3)),
+            "reverse": bool(sampler_params.get("reverse", False)),
+        }
+        sampler_base_steps = int(sampler_params.get("num_steps", 50))
+    # Normalise sample steps now that Stage-II defaults are known.
+    raw_sample_steps = args.sample_steps if args.sample_steps is not None else [sampler_base_steps]
+    if isinstance(raw_sample_steps, (int, float)):
+        raw_sample_steps = [raw_sample_steps]
+    else:
+        raw_sample_steps = list(raw_sample_steps)
+    normalised_steps: List[int] = []
+    for value in raw_sample_steps:
+        try:
+            step_int = int(value)
+        except (TypeError, ValueError):
+            continue
+        if step_int > 0:
+            normalised_steps.append(step_int)
+    if not normalised_steps:
+        normalised_steps = [sampler_base_steps]
+    seen_steps: set[int] = set()
+    ordered_sample_steps: List[int] = []
+    for step_int in normalised_steps:
+        if step_int not in seen_steps:
+            seen_steps.add(step_int)
+            ordered_sample_steps.append(step_int)
+    args.sample_steps = ordered_sample_steps
     if is_main:
         print(f"[Info] Latent size: {model.latent_dim} dim, grid {model.latent_grid}x{model.latent_grid}")
-        print("[Info] Using cosine alpha/sigma schedule for diffusion timesteps.")
+        print(f"[Info] Stage-II transport: path={transport_params.get('path_type', 'Linear')}, prediction={transport_params.get('prediction', 'velocity')}, time_dist_shift={time_dist_shift:.4f}")
 
     stage1_params = stage1_dict.get("params", {})
     stage1_noise_tau = float(stage1_params.get("noise_tau", 0.0))
@@ -404,7 +422,6 @@ def main() -> None:
     perceptual_weight = float(args.lpips_weight if args.lpips_weight is not None else loss_cfg.get("perceptual_weight", 1.0))
     recon_weight = float(args.recon_weight if args.recon_weight is not None else 1.0)
     noise_std = stage1_noise_tau if args.noise_augment_std is None else args.noise_augment_std
-    diffusion_loss_gamma = float(args.diffusion_loss_gamma)
     disc_cfg = gan_cfg.get("disc", {})
     disc_weight = float(loss_cfg.get("disc_weight", 0.0))
     gan_start_epoch = int(loss_cfg.get("disc_start", 0))
@@ -416,19 +433,6 @@ def main() -> None:
 
     image_log_interval = args.image_log_interval if args.image_log_interval is not None else args.log_interval * 20
 
-    # Compute time shift alpha from config if not provided
-    time_shift_alpha = args.time_shift_alpha
-    if time_shift_alpha is None:
-        shift_dim = misc_cfg.get("time_dist_shift_dim") if isinstance(misc_cfg, dict) else None
-        shift_base = misc_cfg.get("time_dist_shift_base") if isinstance(misc_cfg, dict) else None
-        if shift_dim is not None and shift_base is not None and float(shift_base) > 0:
-            time_shift_alpha = float(shift_dim) / float(shift_base)
-            time_shift_alpha = float(time_shift_alpha ** 0.5)
-        else:
-            time_shift_alpha = 1.0
-    if time_shift_alpha <= 1.0:
-        time_shift_alpha = 1.0
-
     config_for_wandb = {
         "lr_encoder": args.lr_encoder,
         "lr_decoder": args.lr_decoder,
@@ -436,7 +440,6 @@ def main() -> None:
         "recon_weight": recon_weight,
         "lpips_weight": perceptual_weight,
         "diffusion_weight": args.diffusion_weight,
-        "diffusion_loss_gamma": diffusion_loss_gamma,
         "diffusion_start_epoch": args.diffusion_start_epoch,
         "noise_augment_std": noise_std,
         "lpips_start_epoch": lpips_start_epoch,
@@ -445,9 +448,12 @@ def main() -> None:
         "latent_dim": model.latent_dim,
         "latent_grid": model.latent_grid,
         "data_path": str(args.data_path) if args.data_path else "fake",
-        "time_shift_alpha": time_shift_alpha,
-        "schedule_rho": args.schedule_rho,
         "sample_steps": args.sample_steps,
+        "sampler_mode": sampler_mode,
+        "time_dist_shift": time_dist_shift,
+        "transport_path": transport_params.get("path_type", "Linear"),
+        "transport_prediction": transport_params.get("prediction", "velocity"),
+        "sampler_defaults": sampler_defaults,
         "freeze_decoder": bool(args.freeze_decoder),
         "params_encoder_total": int(enc_total_params),
         "params_decoder_total": int(dec_total_params),
@@ -617,6 +623,8 @@ def main() -> None:
                 if is_main:
                     print(f"[Debug] Latent shape confirmed: {latents_clean.shape}")
             latents_base = latents_clean
+
+            # assert noise_std == 0, "Noise augmentation is not supported for native diffusion"
             if noise_std > 0:
                 sigma = noise_std * torch.rand(latents_base.size(0), device=device).view(-1, 1, 1, 1)
                 latents_noisy = latents_base + sigma * torch.randn_like(latents_base)
@@ -646,23 +654,14 @@ def main() -> None:
             total_loss_value = total_loss.detach().item()
             recon_opt.step()
 
-            # here, I want to add a batch-normalization to the latents. 
-            # This is to align the mean and variance of the latents with Gaussian noise, so diffusion can be more stable.
-            # this means, we first batch-normalize the latents, then apply noise and calculate the diffusion loss.
-            # in the later decoding stage, we of course need to un-batch-normalize the latents before decoding.
-            # In the generation stage, we need to deonise a normalized clean latent first; 
-            # and then use the batch statistics to de-normalize the latents, and then decode.
+            # Track latent statistics with an EMA so that sampling/visualisation can denormalise consistently later on.
 
-            # so, basically I want the diffusion process to happen with targets being normalized. 
-            #  And since our encoder is changing along training, we have to use batch statistics to normalize the latents.
-
-            # Diffusion step (optional warm-up)
+            # Diffusion step (optional warm-up) using Stage-II transport
             with torch.no_grad():
                 latents_detached = latents_base.detach()
             bn_mean_use = bn_ema_mean
             bn_std_use = bn_ema_var.sqrt().clamp(min=1e-6)
             train_diffusion = step >= diffusion_start_step
-            diff_loss = torch.zeros((), device=device)
             diff_loss_value = 0.0
             if is_main and not train_diffusion and not diffusion_warmup_logged:
                 print(
@@ -671,22 +670,9 @@ def main() -> None:
                 diffusion_warmup_logged = True
             if train_diffusion:
                 diff_opt.zero_grad(set_to_none=True)
-                t_raw = torch.rand(batch_images.size(0), device=device).clamp(0.001, 0.999)
-                # time-shift: t' = (alpha * t) / (1 + (alpha - 1) * t), alpha>=1 emphasizes small-noise
-                if time_shift_alpha is not None and time_shift_alpha > 1.0:
-                    a = time_shift_alpha
-                    t = (a * t_raw) / (1.0 + (a - 1.0) * t_raw)
-                else:
-                    t = t_raw
-                z_norm = (latents_detached - bn_mean_use) / bn_std_use
-                eps = torch.randn_like(z_norm)
-                x_t = (1.0 - t).view(-1, 1, 1, 1) * eps + t.view(-1, 1, 1, 1) * z_norm
-                target_flow = (z_norm - eps)
-                pred_flow = model.forward_diffusion(x_t, t)
-                # per-sample squared error then weight: w(t) = (1 - t)^gamma
-                per_sample = (pred_flow - target_flow).pow(2).flatten(1).mean(dim=1)
-                weights = (1.0 - t).pow(diffusion_loss_gamma)
-                diff_loss = (per_sample * weights).mean() * args.diffusion_weight
+                # Unconditional: pass channel-first latents directly (transport can handle CF)
+                terms = transport.training_losses(velocity_model, latents_base, {})
+                diff_loss = terms["loss"].mean() * args.diffusion_weight
                 diff_loss.backward()
                 diff_opt.step()
                 diff_loss_value = diff_loss.detach().item()
@@ -818,7 +804,7 @@ def main() -> None:
                 interval_sums.clear()
                 interval_counts.clear()
 
-            if train_diffusion and (step == starting_step + 1 or step % image_log_interval == 0) and is_main:
+            if (step == starting_step + 1 or (train_diffusion and step % image_log_interval == 0)) and is_main:
                 diffusion_preds: Dict[float, Tuple[torch.Tensor, torch.Tensor]] = {}
                 with torch.no_grad():
                     # switch to eval() to avoid dropout randomness during visualization
@@ -839,24 +825,23 @@ def main() -> None:
                         1.0,
                     ]
                     for t_val in diffusion_levels:
-                        t_level = torch.full((latents_base.size(0),), t_val, device=device)
-                        # apply the same time-shift used in training/sampling
-                        if time_shift_alpha is not None and time_shift_alpha > 1.0:
-                            a = time_shift_alpha
-                            t_level = (a * t_level) / (1.0 + (a - 1.0) * t_level)
-                        # FM visualization: build x_t from BN-normalized latents and epsilon (use EMA stats)
-                        mu_v = bn_ema_mean
-                        std_v = bn_ema_var.sqrt().clamp(min=1e-6)
-                        z_norm_v = (latents_base - mu_v) / std_v
-                        eps_v = torch.randn_like(z_norm_v)
-                        x_t_v = (1.0 - t_level).view(-1, 1, 1, 1) * eps_v + t_level.view(-1, 1, 1, 1) * z_norm_v
-                        pred_flow_v = model.forward_diffusion(x_t_v, t_level)
-                        z1_pred = x_t_v + (1.0 - t_level).view(-1, 1, 1, 1) * pred_flow_v
-                        # denormalize for decode
-                        z1_denorm = z1_pred * std_v + mu_v
-                        direct_decode = model.decode(x_t_v * std_v + mu_v)
-                        pred_decode = model.decode(z1_denorm)
+                        base_t = torch.full((latents_base.size(0),), float(t_val), device=device, dtype=latents_base.dtype)
+                        if time_dist_shift > 1.0:
+                            shifted_t = time_dist_shift * base_t / (1.0 + (time_dist_shift - 1.0) * base_t)
+                        else:
+                            shifted_t = base_t
+                        # Build x_t via transport path in channel-first
+                        noise_cf = torch.randn_like(latents_base)
+                        _, x_t_cf, _ = transport.path_sampler.plan(shifted_t, noise_cf, latents_base)
+                        # Predict velocity in CF
+                        pred_flow_cf = velocity_model(x_t_cf, shifted_t)
+                        # Linear path clean latent: x1 = x_t + (1 - t) * v (only valid for Linear path)
+                        clean_latents_cf = x_t_cf + (1.0 - shifted_t).view(-1, 1, 1, 1) * pred_flow_cf
+                        # Decode direct noisy and denoised
+                        direct_decode = model.decode(x_t_cf)
+                        pred_decode = model.decode(clean_latents_cf)
                         diffusion_preds[t_val] = (direct_decode, pred_decode)
+                        del noise_cf, x_t_cf, pred_flow_cf, clean_latents_cf
                     # restore mode
                     if was_training:
                         model.train()
@@ -899,15 +884,16 @@ def main() -> None:
                 for sample_step_count in args.sample_steps:
                     step_count = max(1, int(sample_step_count))
                     samples, sample_progress = generate_samples(
-                        model,
+                        transport_sampler=transport_sampler,
+                        sampler_mode=sampler_mode,
+                        sampler_defaults=sampler_defaults,
+                        velocity_model=velocity_model,
+                        model=model,
                         batch_size=k_vis,
                         latent_dim=model.latent_dim,
                         latent_grid=model.latent_grid,
                         device=device,
                         num_steps=step_count,
-                        schedule_rho=float(args.schedule_rho),
-                        time_shift_alpha=time_shift_alpha,
-                        # Prefer EMA stats to stabilize offline sampling semantics
                         bn_mean=bn_ema_mean,
                         bn_std=bn_ema_var.sqrt().clamp(min=1e-6),
                     )

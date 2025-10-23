@@ -83,4 +83,58 @@ torchrun --standalone --nnodes=1 --nproc_per_node=8 \
   --time-shift-alpha 6.93 \
   --diffusion-loss-gamma 1.5 \
   --schedule-rho 1.5 \
-  --sample-steps 250
+  --sample-steps 250 \
+  --resume
+
+
+
+# 1022 evening 
+torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+  src/train_unified_v2.py \
+  --stage1-config configs/stage1/training/MAE-B_dec_sample.yaml \
+  --stage2-config configs/stage2/training/ImageNet256/DiTDH-S_MAE-B.yaml \
+  --data-path /mnt/localssd/data/imagenet100/train/ \
+  --output-dir results/unified_phase3_fourth_run \
+  --epochs 100 \
+  --batch-size 32 \
+  --workers 8 \
+  --lr-encoder 1e-4 \
+  --lr-decoder 1e-4 \
+  --lr-diffusion 2e-4 \
+  --recon-weight 1.0 \
+  --lpips-weight 1.0 \
+  --diffusion-weight 1.0 \
+  --log-interval 50 \
+  --image-log-interval 1000 \
+  --save-interval 1000 \
+  --wandb \
+  --run-name "phase3-gan-timeshift-fm-ema_BN" \
+  --time-shift-alpha 6.93 \
+  --diffusion-loss-gamma 1.5 \
+  --schedule-rho 1.5 \
+  --resume
+
+# 1023 morning
+torchrun --standalone --nnodes=1 --nproc_per_node=8 \
+  src/train_unified_v3.py \
+  --stage1-config configs/stage1/training/MAE-B_dec_sample.yaml \
+  --stage2-config configs/stage2/training/ImageNet256/DiTDH-S_MAE-B.yaml \
+  --data-path /mnt/localssd/data/imagenet100/train/ \
+  --output-dir results/unified_phase3_fifth_run \
+  --epochs 200 \
+  --batch-size 32 \
+  --workers 8 \
+  --lr-encoder 1e-4 \
+  --lr-decoder 1e-4 \
+  --lr-diffusion 2e-4 \
+  --recon-weight 1.0 \
+  --lpips-weight 1.0 \
+  --diffusion-weight 1.0 \
+  --diffusion-start-epoch 10 \
+  --noise-augment-std 0.05 \
+  --log-interval 50 \
+  --image-log-interval 1000 \
+  --save-interval 1000 \
+  --wandb \
+  --run-name "mae-stage1+2-nativeDiff-noisyD" \
+  --resume
