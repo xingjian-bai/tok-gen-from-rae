@@ -1,0 +1,53 @@
+training:
+  epochs: 400
+  ema_decay: 0.9978
+  batch_size: 96 # per-proc bs --> make sure total bs is 512
+  num_workers: 8
+  clip_grad: 0.0
+  log_interval: 20
+  checkpoint_interval: 5000
+  visualization_interval: 1000
+  wandb_interval: 100
+  sample_interval: 0
+  optimizer:
+    lr: 2.0e-4
+    betas: [0.5, 0.9]
+    weight_decay: 0.0
+  scheduler:
+    type: cosine
+    warmup_epochs: 1
+    decay_end_epoch: 16
+    base_lr: 2.0e-4
+    final_lr: 2.0e-5
+
+gan:
+  disc:
+    arch:
+      dino_ckpt_path: 'modules/disc/dino_vit_small_patch8_224.pth.bin'
+      ks: 9
+      norm_type: 'bn'
+      using_spec_norm: true
+      recipe: 'S_8'
+    optimizer:
+      lr: 2.0e-4
+      betas: [0.5, 0.9]
+      weight_decay: 0.0
+    scheduler:
+      type: cosine
+      warmup_epochs: 1
+      decay_end_epoch: 16
+      base_lr: 2.0e-4
+      final_lr: 2.0e-5
+    augment:
+      prob: 1.0
+      cutout: 0.0
+  loss:
+    disc_loss: hinge
+    gen_loss: vanilla
+    disc_weight: 0.75
+    perceptual_weight: 1.0
+    disc_start: 80
+    disc_upd_start: 70
+    lpips_start: 0
+    max_d_weight: 10000.0
+    disc_updates: 1
