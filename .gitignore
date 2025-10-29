@@ -1,0 +1,3 @@
+datasets/
+external/
+*/run_scripts/slurm_logs
