@@ -5,3 +5,4 @@ datasets/
 external/
 */run_scripts/slurm_logs
 */dino_vit_small_patch8_224.pth.bin
+*output*
