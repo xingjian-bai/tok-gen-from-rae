@@ -4,5 +4,11 @@
 datasets/
 external/
 */run_scripts/slurm_logs
+<<<<<<< Updated upstream
 */dino_vit_small_patch8_224.pth.bin
 *output*
+=======
+__pycache__
+output*
+wandb
+>>>>>>> Stashed changes
