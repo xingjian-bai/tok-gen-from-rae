@@ -1,13 +1,13 @@
 training:
-  epochs: 400
+  epochs: 40000
   ema_decay: 0.9978
-  batch_size: 96 # per-proc bs --> make sure total bs is 512
+  batch_size: 64 # per-proc bs --> make sure total bs is 512
   num_workers: 8
   clip_grad: 0.0
   log_interval: 20
-  checkpoint_interval: 5000
-  visualization_interval: 1000
-  wandb_interval: 100
+  checkpoint_interval: 2000
+  visualization_interval: 50 #1000
+  wandb_interval: 10 #100
   sample_interval: 0
   optimizer:
     lr: 2.0e-4
@@ -15,8 +15,8 @@ training:
     weight_decay: 0.0
   scheduler:
     type: cosine
-    warmup_epochs: 1
-    decay_end_epoch: 16
+    warmup_epochs: 400 #1
+    decay_end_epoch: 2000 #16
     base_lr: 2.0e-4
     final_lr: 2.0e-5
 
@@ -46,8 +46,8 @@ gan:
     gen_loss: vanilla
     disc_weight: 0.75
     perceptual_weight: 1.0
-    disc_start: 80
-    disc_upd_start: 70
+    disc_start: 50000 #80
+    disc_upd_start: 50000 #70
     lpips_start: 0
     max_d_weight: 10000.0
     disc_updates: 1

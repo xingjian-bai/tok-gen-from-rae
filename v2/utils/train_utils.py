@@ -99,6 +99,11 @@ def prepare_dataloader(
         ]
     )
     dataset = ImageFolder(str(data_path), transform=transform)
+    from torch.utils.data import Subset, ConcatDataset
+    dataset = Subset(dataset, [1])
+    repeats = 128
+    dataset = ConcatDataset([dataset] * repeats)
+
     sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
     loader = DataLoader(
         dataset,

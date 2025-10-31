@@ -89,7 +89,7 @@ def train_one_epoch(
         epoch_metrics["lpips"] += output_dict["lpips_loss"].detach()
         epoch_metrics["gan"] += output_dict["gan_loss"].detach()
         epoch_metrics["total"] += total_loss.detach()
-        epoch_metrics["diffusion"] += output_dict["diffusion_loss"].detach()
+        epoch_metrics["diffusion"] += output_dict["diffusion/diffusion_loss"].detach()
         num_batches += 1
         epoch_metrics["num_batches"] = num_batches
         
@@ -133,8 +133,15 @@ def train_one_epoch(
                 "loss/recon": output_dict["rec_loss"].detach().item(),
                 "loss/lpips": output_dict["lpips_loss"].detach().item(),
                 "loss/gan": output_dict["gan_loss"].detach().item(),
-                "loss/diffusion": output_dict["diffusion_loss"].detach().item(),
                 "gan/weight": output_dict["adaptive_weight"].detach().item(),
+                "lr/generator": optimizer.param_groups[0]["lr"],
+
+
+                # "loss/diffusion-recon": output_dict["diffusion/rec_loss"].detach().item(),
+                # "loss/diffusion-lpips": output_dict["diffusion/lpips_loss"].detach().item(),
+                # "loss/diffusion-gan": output_dict["diffusion/gan_loss"].detach().item(),
+                "loss/diffusion-diffusion": output_dict["diffusion/diffusion_loss"].detach().item(),
+                # "gan/diffusion-weight": output_dict["diffusion/adaptive_weight"].detach().item(),
                 "lr/generator": optimizer.param_groups[0]["lr"],
             }
             if disc_metrics:

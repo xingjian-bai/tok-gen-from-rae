@@ -212,7 +212,7 @@ class GaussianDiffusion:
         )
     
     def ip_sample(self, x_t, t, rho=0.2, extra_noise=None):
-        # assert(False)
+        assert(False)
         # print("running ip sample....")
         if extra_noise is None:
             extra_noise = th.randn_like(x_t)
@@ -540,16 +540,16 @@ class GaussianDiffusion:
             noise = th.randn_like(x_start)
         x_t = self.q_sample(x_start, t, noise=noise)
         
-        p_ip, rho = 0.4, 0.2
-        use_ip = th.rand(x_t.size(0), device=x_t.device) < p_ip
-        if use_ip.any():
-            x_t_ip = self.ip_sample(x_t[use_ip], t[use_ip], rho=rho)
-            x_in = x_t.clone()
-            x_in[use_ip] = x_t_ip
-        else:
-            x_in = x_t
+        # p_ip, rho = 0.4, 0.2
+        # use_ip = th.rand(x_t.size(0), device=x_t.device) < p_ip
+        # if use_ip.any():
+        #     x_t_ip = self.ip_sample(x_t[use_ip], t[use_ip], rho=rho)
+        #     x_in = x_t.clone()
+        #     x_in[use_ip] = x_t_ip
+        # else:
+        #     x_in = x_t
 
-        x_t = x_in
+        # x_t = x_in
         
         # print(t[0], x_t[0].min(), x_t[0].max(), x_t[0].mean(), x_t[0].std(), "pre diffusion min max mean")
         # print("================ diffusion training =========================")

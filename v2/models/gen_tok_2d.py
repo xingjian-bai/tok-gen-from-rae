@@ -126,11 +126,11 @@ class GenTok2D(nn.Module):
         if not only_reconstruction and self.optimizer_idx=="generator":
             learned_latent_tokens = output_dict['learned_latent_tokens']
             learned_latent_tokens = learned_latent_tokens.reshape(learned_latent_tokens.shape[0], learned_latent_tokens.shape[1], -1).permute([0,2,1])
-            generation_dict = self.forward_generative_modeling(learned_latent_tokens, x_noise)
+            generation_dict = self.forward_generative_modeling(imgs, learned_latent_tokens, x_noise)
             total_loss = total_loss + generation_dict["total_loss"]
             for key in generation_dict.keys():
                 output_dict[key] = generation_dict[key]
-
+            output_dict["total_loss"]=total_loss
         return total_loss, output_dict
 
 
@@ -193,7 +193,7 @@ class GenTok2D(nn.Module):
         return reconstruction_loss, reconstruction_dict, x_noise
 
 
-    def forward_generative_modeling(self, z, z_noise, y=None):
+    def forward_generative_modeling(self, imgs, z, z_noise, y=None):
         # model_kwargs = dict(y=y)
         # loss_dict = self.transport.training_losses(self.encoder, z, model_kwargs)
 
@@ -210,26 +210,44 @@ class GenTok2D(nn.Module):
         diffusion_loss_dict = self.diffusion.training_losses(self.encoder, z.detach(), diffusion_t, diffusion_model_kwargs, noise=z_noise)
         diffusion_loss = diffusion_loss_dict["loss"].mean()
         total_loss = diffusion_loss
+        output_dict = {}
 
-        output_dict = {"diffusion_loss": diffusion_loss, "total_loss": total_loss}
+        if self.training and self.optimizer_idx == "generator":
+            # _prev_req = [p.requires_grad for p in self.decoder.parameters()]
+            # _prev_mode = self.decoder.training
+            # for p in self.decoder.parameters():
+            #     p.requires_grad_(False)
+            # self.decoder.eval()  # optional: avoid BN/dr dropout drift
+
+            # denoised_reconstructed_imgs = self.decode(diffusion_loss_dict["model_output"], reshape_to_2d=False)
+            # total_loss, output_dict = self.forward_reconstruction_loss(denoised_reconstructed_imgs, imgs, self.optimizer_idx, branch_name="diffusion/", total_loss=total_loss)
+            
+            # for p, rg in zip(self.decoder.parameters(), _prev_req):
+            #     p.requires_grad_(rg)
+            # self.decoder.train(_prev_mode)
+
+            output_dict.update({"diffusion/diffusion_loss": diffusion_loss})
+            output_dict.update(total_loss=total_loss)
+        
 
         if not self.training:
+            output_dict = {}
+            output_dict.update({"diffusion/diffusion_loss": diffusion_loss})
+            output_dict.update(total_loss=total_loss)    
+
             ## single step denoising visualizations...
-            
-            samples = diffusion_loss_dict["model_output"]
-            denoised_reconstructed_imgs = self.decode(samples, reshape_to_2d=False)
+            denoised_reconstructed_imgs = self.decode(diffusion_loss_dict["model_output"], reshape_to_2d=False)
             groups = group_images_by_timestep(denoised_reconstructed_imgs, diffusion_t, name_tag="single_step_denoised_reconstructed_imgs")
             output_dict.update(groups)
 
         return output_dict
         
 
-    def forward_reconstruction_loss(self, recon, imgs, optimizer_idx):
-        
+    def forward_reconstruction_loss(self, recon, imgs, optimizer_idx, branch_name="", total_loss=0.):
+
         real_normed = imgs * 2.0 - 1.0
         recon_normed = recon * 2.0 - 1.0
         output_dict = {}
-        total_loss = 0.
 
         if self.training and optimizer_idx=="generator":
             self.discriminator.eval()
@@ -238,7 +256,10 @@ class GenTok2D(nn.Module):
                 lpips_loss = self.lpips(imgs, recon)
             else:
                 lpips_loss = rec_loss.new_zeros(())
-            recon_total = rec_loss + self.perceptual_weight * lpips_loss
+            if "diffusion" in branch_name:
+                recon_total = self.perceptual_weight * lpips_loss
+            else:
+                recon_total = rec_loss + self.perceptual_weight * lpips_loss
 
             if self.use_gan:
                 fake_aug = self.disc_aug.aug(recon_normed)
@@ -247,18 +268,18 @@ class GenTok2D(nn.Module):
                 adaptive_weight = calculate_adaptive_weight(
                     recon_total, gan_loss, self.last_layer, self.max_d_weight
                 )
-                total_loss = recon_total + self.disc_weight * adaptive_weight * gan_loss
+                total_loss = total_loss + recon_total + self.disc_weight * adaptive_weight * gan_loss
             else:
                 gan_loss = torch.zeros_like(recon_total)
                 adaptive_weight = torch.zeros_like(recon_total)
-                total_loss = recon_total
+                total_loss = total_loss + recon_total
 
             output_dict = {
-                'rec_loss': rec_loss,
-                'recon_total': recon_total,
-                'lpips_loss': lpips_loss,
-                'gan_loss': gan_loss,
-                'adaptive_weight': adaptive_weight,
+                '{}rec_loss'.format(branch_name): rec_loss,
+                '{}recon_total'.format(branch_name): recon_total,
+                '{}lpips_loss'.format(branch_name): lpips_loss,
+                '{}gan_loss'.format(branch_name): gan_loss,
+                '{}adaptive_weight'.format(branch_name): adaptive_weight,
             }
 
         elif self.training and optimizer_idx=="discriminator":
@@ -271,16 +292,18 @@ class GenTok2D(nn.Module):
             real_input = self.disc_aug.aug(real_normed)
             logits_fake, logits_real = self.discriminator(fake_input, real_input)
             d_loss = self.disc_loss_fn(logits_real, logits_fake)
-            total_loss = d_loss
+            total_loss = total_loss + d_loss
 
             output_dict = {
-                'disc_loss': d_loss.detach(),
-                'logits_fake': logits_fake.detach().mean(),
-                'logits_real': logits_real.detach().mean()
+                '{}disc_loss'.format(branch_name): d_loss.detach(),
+                '{}logits_fake'.format(branch_name): logits_fake.detach().mean(),
+                '{}logits_real'.format(branch_name): logits_real.detach().mean()
             }
         
-        output_dict.update(recon=recon)
-        output_dict.update(total_loss=total_loss)
+        output_dict.update({
+            f"{branch_name}recon": recon,
+            f"total_loss": total_loss,
+        })
 
         return total_loss, output_dict
     
